@@ -2,114 +2,23 @@
 
 ## API Endpoints
 
-ScopeGuard exposes a REST API with the following endpoints:
+ScopeGuard exposes a REST API. All endpoints accept and return JSON.
 
 ### POST /tokenize
 
-Detect and replace PII/PHI entities in text.
-
-**Request:**
-```json
-{
-  "text": "Patient John Smith, SSN 123-45-6789, was admitted on 2026-03-15.",
-  "scope": "clinical_summary",
-  "session_id": "session-abc-123"
-}
-```
-
-**Response:**
-```json
-{
-  "filtered_text": "Patient [PERSON_a1b2c3d4], SSN [US_SSN_5b87b2b5], was admitted on 2026-03-15.",
-  "entities_found": [
-    {
-      "entity_type": "PERSON",
-      "score": 0.92,
-      "action": "tokenized"
-    },
-    {
-      "entity_type": "US_SSN",
-      "score": 1.0,
-      "action": "tokenized"
-    },
-    {
-      "entity_type": "DATE_TIME",
-      "score": 0.85,
-      "action": "allowed_by_scope"
-    }
-  ],
-  "session_id": "session-abc-123"
-}
-```
-
-Note: The date was detected but allowed through because the `clinical_summary` scope permits `DATE_TIME` entities.
+Submit text for PII/PHI detection and tokenization. Specify a scope to control which entity types are tokenized and which are allowed through. Returns the filtered text with sensitive entities replaced by reversible tokens, along with a summary of what was detected and what action was taken.
 
 ### POST /detokenize
 
-Restore original values from tokens.
-
-**Request:**
-```json
-{
-  "text": "Patient [PERSON_a1b2c3d4] has been discharged. Please notify [PERSON_a1b2c3d4] at their home address.",
-  "session_id": "session-abc-123"
-}
-```
-
-**Response:**
-```json
-{
-  "restored_text": "Patient John Smith has been discharged. Please notify John Smith at their home address.",
-  "tokens_resolved": 2
-}
-```
-
-Note: The same token resolves to the same value throughout the session, so the model's references stay consistent.
+Submit tokenized text to restore original values. Requires the session ID from the original tokenization call. Tokens are consistent within a session, so the same entity always resolves to the same original value.
 
 ### POST /analyze
 
-Detect PII/PHI entities without tokenizing. Useful for auditing or building dashboards.
-
-**Request:**
-```json
-{
-  "text": "Contact Jane Doe at jane@example.com or 555-0123.",
-  "scope": "default"
-}
-```
-
-**Response:**
-```json
-{
-  "entities": [
-    {"entity_type": "PERSON", "score": 0.95, "start": 8, "end": 16},
-    {"entity_type": "EMAIL_ADDRESS", "score": 1.0, "start": 20, "end": 36},
-    {"entity_type": "PHONE_NUMBER", "score": 0.88, "start": 40, "end": 48}
-  ]
-}
-```
+Detect PII/PHI entities in text without performing tokenization. Returns entity types, confidence scores, and positions. Useful for auditing, dashboards, or pre-flight checks before sending data to an LLM.
 
 ### POST /proxy
 
-Full transparent proxy mode. Send a complete LLM API request; ScopeGuard tokenizes it, forwards to the provider, detokenizes the response, and returns it.
-
-**Request:**
-```json
-{
-  "provider": "anthropic",
-  "scope": "default",
-  "session_id": "session-abc-123",
-  "request_body": {
-    "model": "claude-sonnet-4-20250514",
-    "max_tokens": 1024,
-    "messages": [
-      {"role": "user", "content": "Summarize the medical history for patient John Smith, SSN 123-45-6789."}
-    ]
-  }
-}
-```
-
-The model receives the tokenized version. The response is detokenized before reaching your application. Your code does not need to handle tokenization at all.
+Full transparent proxy mode. Submit a complete LLM API request and ScopeGuard handles the full round-trip: tokenize the request, forward it to the provider, detokenize the response, and return it. Your application code does not need to handle tokenization at all. Supports multiple LLM providers.
 
 ### GET /health
 
@@ -123,77 +32,37 @@ List available scopes and their configurations.
 
 Inspect the token vault for a session (admin access required). Useful for debugging and auditing.
 
-## Scope Configuration
+## Scopes
 
-Scopes are defined in a JSON file. Example:
+Scopes define per-workflow tokenization policies: which entity types to protect, which to allow through, and at what confidence level. Different workflows can apply different protection levels without code changes.
 
-```json
-{
-  "clinical_summary": {
-    "description": "Allow dates and locations for clinical context",
-    "default_action": "tokenize",
-    "default_threshold": 0.7,
-    "allow": ["DATE_TIME", "LOCATION"],
-    "overrides": {
-      "US_SSN": {"threshold": 0.2},
-      "CREDIT_CARD": {"threshold": 0.3}
-    }
-  }
-}
-```
+Examples of scope differentiation:
 
-- `default_action`: What to do with detected entities (`tokenize` or `allow`)
-- `default_threshold`: Minimum NER confidence score to trigger tokenization
-- `allow`: Entity types that pass through untokenized in this scope
-- `overrides`: Per-entity-type threshold overrides (lower = more aggressive detection)
+- A **clinical** scope might allow dates and locations through (needed for medical context) while blocking all patient identifiers
+- A **billing** scope might allow person names and dates (needed for invoicing) while blocking SSNs and financial instruments
+- A **security operations** scope might allow network indicators through (needed for triage) while blocking personal identity data
+- A **maximum protection** scope blocks everything above a low confidence threshold
 
-## Integration Patterns
+Scopes are defined in configuration, not code. Adding or modifying a scope requires no deployment.
 
-### Python (requests)
+## Deployment Modes
 
-```python
-import requests
+ScopeGuard supports three deployment patterns:
 
-SCOPEGUARD_URL = "http://localhost:8990"
+### Standalone API
 
-def tokenize(text, scope="default", session_id=None):
-    resp = requests.post(f"{SCOPEGUARD_URL}/tokenize", json={
-        "text": text,
-        "scope": scope,
-        "session_id": session_id,
-    })
-    return resp.json()
+Run ScopeGuard as an independent service. Your applications call the tokenization and detokenization endpoints directly, with full control over when and how tokenization happens in your pipeline.
 
-def detokenize(text, session_id):
-    resp = requests.post(f"{SCOPEGUARD_URL}/detokenize", json={
-        "text": text,
-        "session_id": session_id,
-    })
-    return resp.json()
-```
+### Transparent Proxy
 
-### curl
+Run ScopeGuard as a drop-in proxy in front of your LLM provider. Point your existing API base URL at ScopeGuard. Requests and responses are processed transparently. No application code changes required.
 
-```bash
-# Tokenize
-curl -X POST http://localhost:8990/tokenize \
-  -H "Content-Type: application/json" \
-  -d '{"text": "SSN: 123-45-6789", "scope": "default"}'
+### Agent Sidecar
 
-# Detokenize
-curl -X POST http://localhost:8990/detokenize \
-  -H "Content-Type: application/json" \
-  -d '{"text": "[US_SSN_5b87b2b5]", "session_id": "your-session-id"}'
-```
+Run ScopeGuard alongside an AI agent or chatbot. Inbound messages are tokenized before the agent sees them. Outbound responses are detokenized before the user sees them. The agent reasons over tokens, never over real PII.
 
-### Agent Sidecar Pattern
+This mode is particularly effective for AI agents that use tools (MCP, function calling, etc.), where both the agent's reasoning and the tool results may contain sensitive data.
 
-For AI agents (chatbots, copilots, autonomous agents), deploy ScopeGuard as a sidecar that intercepts the message bus:
+## Getting Started
 
-```
-User message ──▶ ScopeGuard /filter ──▶ Agent receives tokenized text
-                                              │
-Agent response ◀── ScopeGuard /send ◀── Agent produces response
-```
-
-The agent never sees real PII. The user sees real values. The audit log captures every substitution.
+ScopeGuard is commercially licensed. Contact [chris@griffincybersolutions.com](mailto:chris@griffincybersolutions.com) for evaluation access, integration support, and pricing.

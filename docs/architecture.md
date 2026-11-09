@@ -8,76 +8,49 @@
 
 3. **Provider-agnostic.** ScopeGuard does not depend on any specific LLM provider's API. It operates at the HTTP layer. If your application can make an HTTP request to an LLM, ScopeGuard can sit in front of it.
 
-4. **No model dependency.** ScopeGuard does not call an LLM to detect PII. Detection uses deterministic pattern matching and a local NER model. This means detection latency is sub-100ms, detection does not cost API tokens, and detection works offline.
+4. **No model dependency.** ScopeGuard does not call an LLM to detect PII. Detection uses a local engine that does not require API tokens, runs offline, and adds sub-100ms latency.
 
-## Component Layout
+## High-Level Flow
 
 ```
-                    ┌─────────────────────────────────────────┐
-                    │            ScopeGuard Core               │
-                    │                                         │
-  Request ─────▶   │  ┌───────────┐   ┌──────────────────┐  │  ─────▶ LLM Provider
-                    │  │  Analyzer │──▶│  Tokenizer       │  │
-  Response ◀────   │  │  Engine   │   │  (replace/restore)│  │  ◀───── LLM Provider
-                    │  └───────────┘   └──────────────────┘  │
-                    │        │                │               │
-                    │        ▼                ▼               │
-                    │  ┌───────────┐   ┌──────────────────┐  │
-                    │  │  Scope    │   │  Token Vault     │  │
-                    │  │  Resolver │   │  (per-session)   │  │
-                    │  └───────────┘   └──────────────────┘  │
-                    │        │                │               │
-                    │        ▼                ▼               │
-                    │  ┌──────────────────────────────────┐  │
-                    │  │         Audit Ledger              │  │
-                    │  └──────────────────────────────────┘  │
-                    └─────────────────────────────────────────┘
+┌──────────────┐     ┌──────────────────┐     ┌──────────────┐
+│              │     │                  │     │              │
+│  Your App    │────>│  ScopeGuard AI   │────>│  LLM API     │
+│              │<────│                  │<────│              │
+│              │     │                  │     │              │
+└──────────────┘     └──────────────────┘     └──────────────┘
+                            │
+                     ┌──────┴──────┐
+                     │ Token Vault │
+                     │ + Audit Log │
+                     └─────────────┘
 ```
 
-### Analyzer Engine
+ScopeGuard intercepts requests on the way to the LLM provider (tokenizing sensitive data) and responses on the way back (restoring original values). The LLM provider never sees real PII. The end user sees real values. The audit log records every substitution.
 
-The detection pipeline runs in two stages:
+## Core Components
 
-1. **Regex recognizers** fire first, catching structured patterns (SSN formats, credit card numbers, phone numbers). These are fast and high-confidence.
-2. **NER recognizers** fire second, catching unstructured entities (person names, locations, medical terms). These use a local spaCy model and produce confidence scores.
+### Detection Engine
 
-Results are merged, deduplicated, and filtered against the active scope's entity-type allowlist and confidence thresholds.
+ScopeGuard uses a hybrid detection pipeline that combines pattern-based recognizers for structured data (SSNs, credit cards, phone numbers) with NER-based recognition for unstructured entities (names, locations, medical terms). Detection is tuned aggressively: the cost of a false positive (tokenizing a non-PII value) is low, while the cost of a false negative (leaking PII) is a compliance event.
 
 ### Scope Resolver
 
-Each request carries a scope identifier (defaulting to the most restrictive scope). The resolver loads the scope definition, which specifies:
-
-- Which entity types are allowed to pass through untokenized
-- The minimum confidence threshold for tokenization per entity type
-- Any custom recognizer overrides
+Each request specifies a scope that controls which entity types are tokenized and which are allowed through. Scopes are defined in configuration and can be changed without code modifications. The most restrictive scope is always the default.
 
 ### Token Vault
 
-The vault is a bidirectional map:
-
-- `real_value -> token` (used during tokenization)
-- `token -> real_value` (used during detokenization)
-
-Tokens are formatted as `[ENTITY_TYPE_hash]` where the hash is a short deterministic digest. This preserves the entity type in the token (useful for downstream processing that needs to know "this was a person name" without knowing the name) while making the token irreversible without vault access.
+Tokens are reversible within a session: the same input consistently produces the same token, so the LLM sees stable references across multi-turn conversations. Detokenization requires the original session's vault. Vaults are isolated per session and expire after a configurable TTL.
 
 ### Audit Ledger
 
-Append-only log. Every detection, tokenization, and detokenization event is recorded with:
-
-- ISO 8601 timestamp
-- Session identifier
-- Entity type
-- Action taken
-- Scope that was active
-- Confidence score (for NER-detected entities)
-
-The ledger never contains original PII values. It records entity types and actions, not content.
+Every detection and tokenization event is logged with timestamp, session, entity type, action taken, and the active scope. The ledger never contains original PII values. It records that a substitution happened and what type of entity was involved, not the entity's content.
 
 ## Deployment Modes
 
 ### Standalone API
 
-Run ScopeGuard as an independent service. Applications call `/tokenize` and `/detokenize` endpoints directly.
+Run ScopeGuard as an independent service. Applications call tokenization and detokenization endpoints directly.
 
 ### Transparent Proxy
 
@@ -85,6 +58,6 @@ Run ScopeGuard as a proxy in front of an LLM provider. Applications point their 
 
 ### Sidecar
 
-Run ScopeGuard alongside an AI agent or chatbot. The agent's message bus routes through ScopeGuard's filter endpoint before messages reach the agent and after the agent produces responses.
+Run ScopeGuard alongside an AI agent or chatbot. The agent's message bus routes through ScopeGuard before messages reach the agent and after the agent produces responses.
 
 This mode is particularly effective for AI agents that use tools (MCP, function calling, etc.), where both the agent's reasoning and the tool results may contain PII.
